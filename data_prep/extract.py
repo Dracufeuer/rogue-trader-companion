@@ -139,8 +139,7 @@ def append_raw_text_fallback(markdown_text: str, page) -> str:
 def repair_collapsed_visual_tables(text: str, page_number: int) -> str:
     """Repair visual tables that are present in text but not detected by PyMuPDF."""
     text = split_multiline_markdown_table_rows(text)
-    text = replace_test_difficulty_table(text)
-    text = replace_collapsed_action_table(text)
+    text = normalize_markdown_tables(text)
     return text
 
 
@@ -171,74 +170,61 @@ def split_multiline_markdown_table_rows(text: str) -> str:
     return "\n".join(repaired)
 
 
-def replace_collapsed_action_table(text: str) -> str:
-    """Replace the page 10 combat-action summary when it collapses into one line."""
-    marker = "**Action Type Description Aim"
-    next_heading = "\n## **Types of Actions**"
-
-    if marker not in text or next_heading not in text:
-        return text
-
-    start = text.index(marker)
-    end = text.index(next_heading, start)
-    table = "\n\n" + "\n".join([
-        "| Action | Type | Description |",
-        "| --- | --- | --- |",
-        "| Aim | Half/Full | +10 bonus to hit as a Half Action or +20 to hit as a Full Action on your next attack. |",
-        "| All Out Attack | Full | +20 to Weapon Skill Test; you cannot Dodge or Parry. |",
-        "| Charge | Full | Rush at an opponent and make a melee attack with a +10 bonus to Weapon Skill. |",
-        "| Dodge | Reaction | Test Dodge to negate a hit. |",
-        "| Full Auto Burst | Full | +20 to Ballistic Skill Test; each degree of success scores an additional hit. |",
-        "| Move | Half/Full | As a Half Action, move up to your Half Move in metres; as a Full Action, move up to your Full Move in metres. |",
-        "| Parry | Reaction | Test Weapon Skill to negate a hit from a melee attack. |",
-        "| Ready | Half | Draw a weapon or prepare an item for use. |",
-        "| Reload | Varies | Reload a ranged weapon. |",
-        "| Run | Full | Move up to your Run Move; enemies receive -20 to Ballistic Skill to hit you and +20 to Weapon Skill to hit you. |",
-        "| Semi-Auto Burst | Full | +10 to Ballistic Skill Test; each two degrees of success scores an additional hit. |",
-        "| Standard Attack | Half | Make one melee or ranged attack. |",
-        "| Use Skill | Varies | You may use a Skill. |",
-    ]) + "\n\n"
-
-    return text[:start].rstrip() + table + text[end:]
-
-
-def replace_test_difficulty_table(text: str) -> str:
-    """Replace the collapsed test difficulty table with clean canonical rows."""
-    if "|**Diff culty**|" not in text and "| Difficulty | Modifier |" not in text:
-        return text
-
+def normalize_markdown_tables(text: str) -> str:
+    """Normalize Markdown tables without inventing missing table content."""
     lines = text.splitlines()
     output = []
     index = 0
 
-    table = [
-        "| Difficulty | Modifier |",
-        "| --- | --- |",
-        "| Easy | +30 |",
-        "| Routine | +20 |",
-        "| Ordinary | +10 |",
-        "| Challenging | +0 |",
-        "| Difficult | -10 |",
-        "| Hard | -20 |",
-        "| Very Hard | -30 |",
-    ]
-
     while index < len(lines):
         line = lines[index]
-        if "|**Diff culty**|" in line or line.strip() == "| Difficulty | Modifier |  |":
-            output.extend(table)
+        if not is_markdown_table_line(line):
+            output.append(line)
             index += 1
-            while index < len(lines):
-                stripped = lines[index].strip()
-                if not stripped.startswith("|") or not stripped.endswith("|"):
-                    break
-                index += 1
             continue
 
-        output.append(line)
-        index += 1
+        block = []
+        while index < len(lines) and is_markdown_table_line(lines[index]):
+            block.append(lines[index])
+            index += 1
+
+        output.extend(normalize_markdown_table_block(block))
 
     return "\n".join(output)
+
+
+def is_markdown_table_line(line: str) -> bool:
+    stripped = line.strip()
+    return stripped.startswith("|") and stripped.endswith("|")
+
+
+def normalize_markdown_table_block(block: list[str]) -> list[str]:
+    rows = []
+    for line in block:
+        cells = [clean_table_cell(cell) for cell in line.strip().strip("|").split("|")]
+        if any(cells):
+            rows.append(cells)
+
+    if not rows:
+        return block
+
+    width = max(len(row) for row in rows)
+    rows = [row + [""] * (width - len(row)) for row in rows]
+
+    normalized = []
+    for row_index, row in enumerate(rows):
+        normalized.append("| " + " | ".join(row) + " |")
+        if row_index == 0 and not table_block_has_separator(rows):
+            normalized.append("| " + " | ".join(["---"] * width) + " |")
+
+    return normalized
+
+
+def table_block_has_separator(rows: list[list[str]]) -> bool:
+    if len(rows) < 2:
+        return False
+    return all(re.fullmatch(r":?-{3,}:?", cell.strip()) for cell in rows[1] if cell.strip())
+
 
 
 def remove_picture_placeholders(text: str) -> str:
@@ -331,7 +317,6 @@ def clean_extracted_markdown(text: str) -> str:
     """Light cleanup for extracted Markdown."""
     text = text.replace("\r\n", "\n")
     text = normalize_pdf_artifacts(text)
-    text = replace_test_difficulty_table(text)
     text = re.sub(r"\n{3,}", "\n\n", text)
     text = re.sub(r"[ \t]+\n", "\n", text)
     return text.strip()
@@ -632,7 +617,7 @@ def generate_qa_from_section(section: dict) -> list[dict]:
     # Choose the right generation prompt based on section type
     if section_type == "bestiary_entry":
         system_instruction = """You are generating training data for a Rogue Trader RPG assistant.
-Given this enemy stat block, generate 3 question-answer pairs that a DM would find useful.
+Given this enemy stat block, generate 8 question-answer pairs that a DM would find useful.
 Focus on: stat lookups, special abilities, tactical advice, and how to use this enemy effectively.
 Output ONLY a JSON array with this exact format, nothing else:
 [
@@ -643,7 +628,7 @@ Output ONLY a JSON array with this exact format, nothing else:
 
     elif section_type == "rules_section":
         system_instruction = """You are generating training data for a Rogue Trader RPG assistant.
-Given this rules section, generate 3 question-answer pairs a DM would ask mid-session.
+Given this rules section, generate 8 question-answer pairs a DM would ask mid-session.
 Focus on: how mechanics work, what modifiers apply, edge cases, and practical application.
 Answers should be conversational and concise — a DM needs fast answers at the table.
 Output ONLY a JSON array with this exact format, nothing else:
@@ -655,7 +640,7 @@ Output ONLY a JSON array with this exact format, nothing else:
 
     elif section_type == "lore_section":
         system_instruction = """You are generating training data for a Rogue Trader RPG assistant.
-Given this lore passage, generate 3 questions about setting, factions, locations or characters.
+Given this lore passage, generate 8 questions about setting, factions, locations or characters.
 Answers should be flavourful and atmospheric, written in the tone of the 40K universe.
 Output ONLY a JSON array with this exact format, nothing else:
 [
@@ -666,7 +651,7 @@ Output ONLY a JSON array with this exact format, nothing else:
 
     else:
         system_instruction = """You are generating training data for a Rogue Trader RPG assistant.
-Given this text, generate 3 useful question-answer pairs for a DM running a Rogue Trader session.
+Given this text, generate 8 useful question-answer pairs for a DM running a Rogue Trader session.
 Output ONLY a JSON array with this exact format, nothing else:
 [
   {"prompt": "question here", "completion": "answer here"},
@@ -688,7 +673,7 @@ Output ONLY a JSON array with this exact format, nothing else:
                 "stream": False,
                 "options": {
                     "temperature": 0.4,
-                    "num_predict": 1000
+                    "num_predict": 2500
                 }
             },
             timeout=120.0
